@@ -1,0 +1,599 @@
+import { useEffect, useState } from 'react';
+import { CheckCircle2, XCircle, ClipboardCheck, ListChecks, Pencil, FileSpreadsheet, Layers } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { catalogApi } from '../catalog/catalogApi';
+import { getErrorMessage } from '../../shared/api/axiosClient';
+import { useAuth } from '../../shared/hooks/useAuth';
+import { useCategories } from '../../shared/hooks/useCategories';
+import { ESTADOS_REVISION, ROLES, tieneDanoFisico, ORDEN_POR_DEFECTO } from '../../shared/constants';
+import { agruparRegistros } from '../../shared/utils/catalogGrouping';
+import DataTable from '../../shared/components/DataTable';
+import Badge from '../../shared/components/Badge';
+import Tabs from '../../shared/components/Tabs';
+import Button from '../../shared/components/Button';
+import Pagination from '../../shared/components/Pagination';
+import Modal from '../../shared/components/Modal';
+import AlertBanner from '../../shared/components/AlertBanner';
+import { Textarea } from '../../shared/components/FormField';
+import SelectorOrden from '../../shared/components/SelectorOrden';
+import CatalogDetailFields from '../catalog/CatalogDetailFields';
+
+const TABS = [
+  { value: ESTADOS_REVISION.PENDIENTE, label: 'Pendientes' },
+  { value: ESTADOS_REVISION.APROBADO, label: 'Aprobados' },
+];
+
+function RegistradoPor({ item }) {
+  if (item.origenImportacion) {
+    const nombre = item.registradoPor?.nombre || 'N/A';
+    return (
+      <span className="flex max-w-[clamp(5.5rem,6vw,10rem)] flex-col" title={`Importado de ${item.origenImportacion} por ${nombre}`}>
+        <span className="inline-flex items-center gap-1 text-slate-600">
+          <FileSpreadsheet size={13} className="shrink-0 text-primary" />
+          <span className="truncate">{item.origenImportacion}</span>
+        </span>
+        <span className="truncate text-[11px] text-slate-400">{nombre}</span>
+      </span>
+    );
+  }
+  return (
+    <span className="block max-w-[clamp(5.5rem,6vw,10rem)] truncate" title={item.registradoPor?.nombre}>
+      {item.registradoPor?.nombre || 'N/A'}
+    </span>
+  );
+}
+
+// Desglose de solo lectura para un grupo de copias ya aprobadas (la pestaña Aprobados no
+// tiene acciones por fila, a diferencia de Pendientes que si las necesita para revisar).
+function ListaCopiasAprobadas({ copias }) {
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      <table className="w-full text-left text-sm">
+        <thead className="bg-white text-xs uppercase tracking-wide text-slate-500">
+          <tr>
+            <th className="px-3 py-2 font-semibold">ID</th>
+            <th className="px-3 py-2 font-semibold">Estado fisico</th>
+            <th className="px-3 py-2 font-semibold">Registrado por</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-border bg-white">
+          {copias.map((copia) => (
+            <tr key={copia._id}>
+              <td className="px-3 py-2 font-medium text-slate-700">{copia.idInventario ?? 'N/A'}</td>
+              <td className="px-3 py-2">
+                {tieneDanoFisico(copia.estadoFisico) ? (
+                  <Badge tone="danger">{copia.estadoFisico}</Badge>
+                ) : (
+                  <span className="block max-w-[14rem] truncate text-slate-500" title={copia.estadoFisico}>
+                    {copia.estadoFisico || 'N/A'}
+                  </span>
+                )}
+              </td>
+              <td className="px-3 py-2">
+                <RegistradoPor item={copia} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export default function ApprovalsPage() {
+  const { user } = useAuth();
+  const { etiquetaDe } = useCategories();
+  const [activeTab, setActiveTab] = useState(ESTADOS_REVISION.PENDIENTE);
+  const [registros, setRegistros] = useState([]);
+  const [totalPages, setTotalPages] = useState(1);
+  const [totalRegistros, setTotalRegistros] = useState(0);
+  const [page, setPage] = useState(1);
+  const [sort, setSort] = useState(ORDEN_POR_DEFECTO);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [mensaje, setMensaje] = useState('');
+  const [seleccionados, setSeleccionados] = useState(new Set());
+  const [seleccionTodasPaginas, setSeleccionTodasPaginas] = useState(false);
+  const [cargandoSeleccionTodas, setCargandoSeleccionTodas] = useState(false);
+  const [itemEnRevision, setItemEnRevision] = useState(null);
+  const [decision, setDecision] = useState('APROBAR');
+  const [observaciones, setObservaciones] = useState('');
+  const [enviando, setEnviando] = useState(false);
+  const [errorModal, setErrorModal] = useState('');
+  const [loteAbierto, setLoteAbierto] = useState(false);
+  const [aprobandoLote, setAprobandoLote] = useState(false);
+  const [errorLote, setErrorLote] = useState('');
+  const [rechazoLoteAbierto, setRechazoLoteAbierto] = useState(false);
+  const [observacionesLote, setObservacionesLote] = useState('');
+  const [rechazandoLote, setRechazandoLote] = useState(false);
+  const [errorRechazoLote, setErrorRechazoLote] = useState('');
+
+  const puedeAprobar = [ROLES.ADMIN, ROLES.MANAGER].includes(user?.rol);
+  const puedeActuar = puedeAprobar && activeTab === ESTADOS_REVISION.PENDIENTE;
+
+  function filaColor(row) {
+    if (row.estadoRevision === ESTADOS_REVISION.APROBADO) return 'bg-emerald-50';
+    if (row.estadoRevision === ESTADOS_REVISION.PENDIENTE) {
+      const yaEditado = row.updatedAt && row.createdAt && row.updatedAt !== row.createdAt;
+      return yaEditado ? 'bg-amber-50' : 'bg-red-50';
+    }
+    return '';
+  }
+
+  async function cargar() {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await catalogApi.list({ estadoRevision: activeTab, page, limit: 15, sort });
+      setRegistros(res.data.data.registros);
+      setTotalPages(res.data.data.totalPages);
+      setTotalRegistros(res.data.data.total);
+    } catch (err) {
+      setError(getErrorMessage(err, 'No se pudo cargar el listado'));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Trae TODOS los pendientes que coinciden con el filtro actual, sin importar la pagina, y
+  // los marca seleccionados de una vez - asi "Aprobar/Rechazar seleccionados" puede actuar
+  // sobre todo el lote, no solo los ~15 que se ven en la pagina actual.
+  async function seleccionarTodasLasPaginas() {
+    setCargandoSeleccionTodas(true);
+    setError('');
+    try {
+      const res = await catalogApi.list({ estadoRevision: activeTab, page: 1, limit: 100000, sort });
+      setSeleccionados(new Set(res.data.data.registros.map((r) => r._id)));
+      setSeleccionTodasPaginas(true);
+    } catch (err) {
+      setError(getErrorMessage(err, 'No se pudo seleccionar todo'));
+    } finally {
+      setCargandoSeleccionTodas(false);
+    }
+  }
+
+  useEffect(() => {
+    cargar();
+    setSeleccionados(new Set());
+    setSeleccionTodasPaginas(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, page, sort]);
+
+  function toggleUno(id) {
+    setSeleccionTodasPaginas(false);
+    setSeleccionados((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleTodos() {
+    setSeleccionTodasPaginas(false);
+    setSeleccionados((prev) => {
+      const todosSeleccionados = registros.length > 0 && registros.every((r) => prev.has(r._id));
+      return todosSeleccionados ? new Set() : new Set(registros.map((r) => r._id));
+    });
+  }
+
+  function abrirRevision(item) {
+    setItemEnRevision(item);
+    setDecision('APROBAR');
+    setObservaciones('');
+    setErrorModal('');
+  }
+
+  async function confirmarDecision() {
+    if (decision === 'RECHAZAR' && !observaciones.trim()) {
+      setErrorModal('Las observaciones son obligatorias al rechazar');
+      return;
+    }
+
+    setEnviando(true);
+    setErrorModal('');
+    try {
+      const payload = { decision, observaciones: observaciones.trim() || undefined };
+      await catalogApi.revisar(itemEnRevision._id, payload);
+      setItemEnRevision(null);
+      setMensaje(decision === 'APROBAR' ? 'Registro aprobado correctamente' : 'Registro rechazado correctamente');
+      await cargar();
+    } catch (err) {
+      setErrorModal(getErrorMessage(err, 'No se pudo procesar la decision'));
+    } finally {
+      setEnviando(false);
+    }
+  }
+
+  async function confirmarLote() {
+    setAprobandoLote(true);
+    setErrorLote('');
+    try {
+      const res = await catalogApi.aprobarLote([...seleccionados]);
+      setMensaje(`${res.data.data.aprobados} registro(s) aprobado(s) correctamente`);
+      setSeleccionados(new Set());
+      setSeleccionTodasPaginas(false);
+      setLoteAbierto(false);
+      await cargar();
+    } catch (err) {
+      setErrorLote(getErrorMessage(err, 'No se pudo aprobar el lote'));
+    } finally {
+      setAprobandoLote(false);
+    }
+  }
+
+  function abrirRechazoLote() {
+    setObservacionesLote('');
+    setErrorRechazoLote('');
+    setRechazoLoteAbierto(true);
+  }
+
+  async function confirmarRechazoLote() {
+    if (!observacionesLote.trim()) {
+      setErrorRechazoLote('Las observaciones son obligatorias al rechazar');
+      return;
+    }
+    setRechazandoLote(true);
+    setErrorRechazoLote('');
+    try {
+      const res = await catalogApi.rechazarLote([...seleccionados], observacionesLote.trim());
+      setMensaje(`${res.data.data.rechazados} registro(s) rechazado(s) correctamente`);
+      setSeleccionados(new Set());
+      setSeleccionTodasPaginas(false);
+      setRechazoLoteAbierto(false);
+      await cargar();
+    } catch (err) {
+      setErrorRechazoLote(getErrorMessage(err, 'No se pudo rechazar el lote'));
+    } finally {
+      setRechazandoLote(false);
+    }
+  }
+
+  // La pestaña "Aprobados" agrupa copias del mismo material en un solo renglon (igual que
+  // Catalogo) - tiene sentido porque ahi ya no hay nada que revisar por separado, es solo
+  // consulta. "Pendientes" se deja sin agrupar: cada copia se revisa (aprueba/rechaza) por su
+  // cuenta, aunque sea copia de otra, asi que agruparlas complicaria esa accion sin necesidad.
+  const filas = activeTab === ESTADOS_REVISION.APROBADO ? agruparRegistros(registros) : registros.map((r) => ({ ...r, copias: [r] }));
+
+  const columns = [
+    ...(puedeActuar
+      ? [
+          {
+            key: 'seleccion',
+            header: (
+              <input
+                type="checkbox"
+                checked={registros.length > 0 && registros.every((r) => seleccionados.has(r._id))}
+                onChange={toggleTodos}
+                className="rounded border-border text-primary focus:ring-primary/30"
+              />
+            ),
+            render: (row) => (
+              <div onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={seleccionados.has(row._id)}
+                  onChange={() => toggleUno(row._id)}
+                  className="rounded border-border text-primary focus:ring-primary/30"
+                />
+              </div>
+            ),
+          },
+        ]
+      : []),
+    {
+      key: 'idInventario',
+      header: 'ID',
+      render: (row) =>
+        row.copias.length > 1 ? (
+          <Badge tone="primary" icon={Layers}>
+            {row.copias.length - 1} {row.copias.length === 2 ? 'copia' : 'copias'}
+          </Badge>
+        ) : (
+          row.idInventario ?? 'N/A'
+        ),
+    },
+    {
+      key: 'categoria',
+      header: 'Categoria',
+      render: (row) => {
+        const etiqueta = etiquetaDe(row.categoria);
+        return (
+          <span className="block max-w-[clamp(5.5rem,6vw,10rem)] truncate" title={etiqueta}>
+            {etiqueta}
+          </span>
+        );
+      },
+    },
+    {
+      key: 'titulo',
+      header: 'Titulo',
+      render: (row) => (
+        <span className="block max-w-[clamp(9rem,13vw,22rem)] truncate" title={row.titulo}>
+          {row.titulo}
+        </span>
+      ),
+    },
+    {
+      key: 'autor',
+      header: 'Autor',
+      render: (row) => (
+        <span className="block max-w-[clamp(6rem,8vw,14rem)] truncate" title={row.autor}>
+          {row.autor}
+        </span>
+      ),
+    },
+    {
+      key: 'estadoFisico',
+      header: 'Estado fisico',
+      render: (row) => {
+        if (row.copias.length > 1) {
+          const conDano = row.copias.filter((c) => tieneDanoFisico(c.estadoFisico));
+          if (conDano.length > 0) {
+            return <Badge tone="danger">{conDano.length} de {row.copias.length} con daño</Badge>;
+          }
+          const texto = row.copias[0].estadoFisico || 'N/A';
+          return (
+            <span className="block max-w-[clamp(7rem,8vw,13rem)] truncate text-slate-500" title={texto}>
+              {texto}
+            </span>
+          );
+        }
+        return tieneDanoFisico(row.estadoFisico) ? (
+          <Badge tone="danger">{row.estadoFisico}</Badge>
+        ) : (
+          <span className="block max-w-[clamp(7rem,8vw,13rem)] truncate" title={row.estadoFisico}>
+            {row.estadoFisico || 'N/A'}
+          </span>
+        );
+      },
+    },
+    {
+      key: 'registradoPor',
+      header: 'Registrado por',
+      render: (row) => {
+        if (row.copias.length > 1) {
+          const claves = new Set(row.copias.map((c) => c.origenImportacion || c.registradoPor?.nombre || 'N/A'));
+          return claves.size === 1 ? <RegistradoPor item={row.copias[0]} /> : 'Varios';
+        }
+        return <RegistradoPor item={row} />;
+      },
+    },
+    ...(puedeActuar
+      ? [
+          {
+            key: 'acciones',
+            header: 'Acciones',
+            render: (row) => (
+              <div className="flex items-center gap-3" onClick={(e) => e.stopPropagation()}>
+                <Link to={`/catalogo/${row._id}/editar`} className="text-primary hover:text-primary-light" title="Editar">
+                  <Pencil size={16} />
+                </Link>
+                <Button variant="secondary" icon={ClipboardCheck} onClick={() => abrirRevision(row)}>
+                  Revisar
+                </Button>
+              </div>
+            ),
+          },
+        ]
+      : []),
+  ];
+
+  function renderExpanded(row) {
+    if (row.copias.length === 1) {
+      return <CatalogDetailFields item={row.copias[0]} />;
+    }
+    return (
+      <div className="flex flex-col gap-4">
+        <CatalogDetailFields item={row.copias[0]} ocultarRevision />
+        <ListaCopiasAprobadas copias={row.copias} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <h1 className="text-xl font-semibold text-primary-dark">Aprobaciones</h1>
+
+      <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
+        <Tabs
+          tabs={TABS}
+          active={activeTab}
+          onChange={(value) => {
+            setActiveTab(value);
+            setPage(1);
+          }}
+        />
+        <SelectorOrden
+          value={sort}
+          onChange={(valor) => {
+            setPage(1);
+            setSort(valor);
+          }}
+        />
+      </div>
+
+      <AlertBanner>{error}</AlertBanner>
+      <AlertBanner type="success">{mensaje}</AlertBanner>
+
+      {puedeActuar && seleccionados.size > 0 ? (
+        <div className="flex flex-col gap-2 rounded-md border border-primary/30 bg-primary/5 px-4 py-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium text-primary-dark">
+              {seleccionados.size} registro{seleccionados.size === 1 ? '' : 's'} seleccionado
+              {seleccionados.size === 1 ? '' : 's'}
+            </span>
+            <div className="flex gap-2">
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setSeleccionados(new Set());
+                  setSeleccionTodasPaginas(false);
+                }}
+              >
+                Cancelar seleccion
+              </Button>
+              <Button variant="danger" icon={XCircle} onClick={abrirRechazoLote}>
+                Rechazar seleccionados
+              </Button>
+              <Button icon={ListChecks} onClick={() => setLoteAbierto(true)}>
+                Aprobar seleccionados
+              </Button>
+            </div>
+          </div>
+          {/* Sin esto, "seleccionados" solo puede llegar a los ~15 registros de la pagina
+              actual (toggleTodos solo marca lo que esta a la vista) - este boton trae el ID
+              de TODOS los pendientes que coinciden con el filtro, sin importar la pagina, para
+              que Aprobar/Rechazar seleccionados actue sobre el lote completo de una vez. */}
+          {!seleccionTodasPaginas && totalPages > 1 ? (
+            <button
+              type="button"
+              onClick={seleccionarTodasLasPaginas}
+              disabled={cargandoSeleccionTodas}
+              className="self-start text-xs font-medium text-primary hover:underline disabled:opacity-50"
+            >
+              {cargandoSeleccionTodas
+                ? 'Seleccionando todo...'
+                : `Seleccionar los ${totalRegistros} pendientes en todas las paginas`}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="flex items-center gap-4 text-xs text-slate-500">
+        <span className="flex items-center gap-1.5">
+          <span className="h-3 w-3 rounded-sm bg-red-50 ring-1 ring-inset ring-red-200" /> Pendiente, sin revisar
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="h-3 w-3 rounded-sm bg-amber-50 ring-1 ring-inset ring-amber-200" /> Pendiente, ya editado
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="h-3 w-3 rounded-sm bg-emerald-50 ring-1 ring-inset ring-emerald-200" /> Aprobado
+        </span>
+      </div>
+
+      <DataTable
+        columns={columns}
+        rows={filas}
+        rowKey="_id"
+        loading={loading}
+        emptyMessage="No hay registros en este filtro"
+        renderExpanded={renderExpanded}
+        rowClassName={filaColor}
+      />
+      <Pagination page={page} totalPages={totalPages} onChange={setPage} />
+
+      <Modal
+        open={!!itemEnRevision}
+        title={`Revisar: ${itemEnRevision?.titulo || ''}`}
+        onClose={() => setItemEnRevision(null)}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setItemEnRevision(null)}>
+              Cancelar
+            </Button>
+            <Button
+              variant={decision === 'RECHAZAR' ? 'danger' : 'primary'}
+              onClick={confirmarDecision}
+              disabled={enviando}
+            >
+              {enviando ? 'Enviando...' : decision === 'RECHAZAR' ? 'Rechazar registro' : 'Aprobar registro'}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setDecision('APROBAR')}
+              className={`flex flex-1 items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium ${
+                decision === 'APROBAR' ? 'border-primary bg-primary/10 text-primary' : 'border-border text-slate-500'
+              }`}
+            >
+              <CheckCircle2 size={16} />
+              Aprobar
+            </button>
+            <button
+              type="button"
+              onClick={() => setDecision('RECHAZAR')}
+              className={`flex flex-1 items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium ${
+                decision === 'RECHAZAR' ? 'border-secondary bg-secondary-light text-secondary' : 'border-border text-slate-500'
+              }`}
+            >
+              <XCircle size={16} />
+              Rechazar
+            </button>
+          </div>
+
+          {decision === 'RECHAZAR' ? (
+            <Textarea
+              label="Observaciones"
+              required
+              placeholder="Explica que se debe corregir"
+              value={observaciones}
+              onChange={(e) => setObservaciones(e.target.value)}
+            />
+          ) : null}
+
+          <AlertBanner>{errorModal}</AlertBanner>
+        </div>
+      </Modal>
+
+      <Modal
+        open={loteAbierto}
+        title="Aprobar registros seleccionados"
+        onClose={() => setLoteAbierto(false)}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setLoteAbierto(false)}>
+              Cancelar
+            </Button>
+            <Button icon={CheckCircle2} onClick={confirmarLote} disabled={aprobandoLote}>
+              {aprobandoLote ? 'Aprobando...' : `Aprobar ${seleccionados.size} registro(s)`}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-sm text-slate-600">
+            Vas a aprobar <strong>{seleccionados.size}</strong> registro{seleccionados.size === 1 ? '' : 's'} de una
+            vez. Quedaran marcados como Aprobados y saldran de la cola de pendientes.
+          </p>
+          <AlertBanner>{errorLote}</AlertBanner>
+        </div>
+      </Modal>
+
+      <Modal
+        open={rechazoLoteAbierto}
+        title="Rechazar registros seleccionados"
+        onClose={() => setRechazoLoteAbierto(false)}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setRechazoLoteAbierto(false)}>
+              Cancelar
+            </Button>
+            <Button variant="danger" icon={XCircle} onClick={confirmarRechazoLote} disabled={rechazandoLote}>
+              {rechazandoLote ? 'Rechazando...' : `Rechazar ${seleccionados.size} registro(s)`}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-sm text-slate-600">
+            Vas a rechazar <strong>{seleccionados.size}</strong> registro{seleccionados.size === 1 ? '' : 's'} de una
+            vez, con el mismo motivo para todos. Cada autor vera esta observacion y podra corregir y reenviar el suyo.
+          </p>
+          <Textarea
+            label="Observaciones"
+            required
+            placeholder="Explica que se debe corregir"
+            value={observacionesLote}
+            onChange={(e) => setObservacionesLote(e.target.value)}
+          />
+          <AlertBanner>{errorRechazoLote}</AlertBanner>
+        </div>
+      </Modal>
+    </div>
+  );
+}

@@ -1,0 +1,151 @@
+import { useEffect, useState } from 'react';
+import { auditApi } from './auditApi';
+import { getErrorMessage } from '../../shared/api/axiosClient';
+import { useAuth } from '../../shared/hooks/useAuth';
+import { useCategories } from '../../shared/hooks/useCategories';
+import { ACCIONES_AUDITORIA, ACCION_LABELS, ACCION_TONOS, ROL_LABELS, ROLES } from '../../shared/constants';
+import DataTable from '../../shared/components/DataTable';
+import Badge from '../../shared/components/Badge';
+import Tabs from '../../shared/components/Tabs';
+import Pagination from '../../shared/components/Pagination';
+import AlertBanner from '../../shared/components/AlertBanner';
+import { Select } from '../../shared/components/FormField';
+import { resumenDetalles } from './detallesAuditoria';
+
+const TABS = [
+  { value: 'reciente', label: 'Recientes (ultimos 30 dias)' },
+  { value: 'archivo', label: 'Archivo' },
+];
+
+function formatearFecha(fecha) {
+  return new Date(fecha).toLocaleString('es-GT', { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+export default function AuditPage() {
+  const { user } = useAuth();
+  const { etiquetaDe } = useCategories();
+  const esAuxiliar = user?.rol === ROLES.USER;
+  const [activeTab, setActiveTab] = useState('reciente');
+  const [registros, setRegistros] = useState([]);
+  const [totalPages, setTotalPages] = useState(1);
+  const [page, setPage] = useState(1);
+  const [accion, setAccion] = useState('');
+  const [usuario, setUsuario] = useState('');
+  const [usuariosFiltrables, setUsuariosFiltrables] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  async function cargar() {
+    setLoading(true);
+    setError('');
+    try {
+      const params = { page, limit: 15 };
+      if (accion) params.accion = accion;
+      if (usuario) params.usuario = usuario;
+      if (activeTab === 'archivo') params.origen = 'archivo';
+      const res = await auditApi.list(params);
+      setRegistros(res.data.data.registros);
+      setTotalPages(res.data.data.totalPages);
+    } catch (err) {
+      setError(getErrorMessage(err, 'No se pudo cargar la auditoria'));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (esAuxiliar) return; // solo ve lo suyo, no tiene sentido pedir la lista de personal
+    auditApi
+      .listUsuarios()
+      .then((res) => setUsuariosFiltrables(res.data.data))
+      .catch(() => setUsuariosFiltrables([]));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    cargar();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, accion, usuario, activeTab]);
+
+  const columns = [
+    { key: 'fecha', header: 'Fecha', render: (row) => formatearFecha(row.fecha) },
+    { key: 'usuario', header: 'Usuario', render: (row) => row.usuario?.nombre || 'Sistema' },
+    {
+      key: 'accion',
+      header: 'Accion',
+      render: (row) => <Badge tone={ACCION_TONOS[row.accion] || 'neutral'}>{ACCION_LABELS[row.accion] || row.accion}</Badge>,
+    },
+    { key: 'entidad', header: 'Entidad' },
+    {
+      key: 'detalles',
+      header: 'Detalles',
+      render: (row) => (
+        <span className="block min-w-[14rem] max-w-md text-xs leading-relaxed text-slate-500">
+          {resumenDetalles(row.detalles, { nombreDeCategoria: etiquetaDe })}
+        </span>
+      ),
+    },
+  ];
+
+  return (
+    <div className="flex flex-col gap-4">
+      <h1 className="text-xl font-semibold text-primary-dark">Auditoria</h1>
+      {esAuxiliar ? <p className="text-sm text-slate-500">Tu historial de acciones - lo que has creado, editado o enviado a revision.</p> : null}
+
+      <Tabs
+        tabs={TABS}
+        active={activeTab}
+        onChange={(value) => {
+          setActiveTab(value);
+          setPage(1);
+        }}
+      />
+      {activeTab === 'archivo' ? (
+        <p className="text-sm text-slate-500">
+          Registros de mas de 30 dias. Se mueven aqui automaticamente para no sobrecargar la vista de Recientes, pero
+          siguen completos y consultables.
+        </p>
+      ) : null}
+
+      <div className="flex gap-3">
+        {esAuxiliar ? null : (
+          <Select
+            value={usuario}
+            onChange={(e) => {
+              setPage(1);
+              setUsuario(e.target.value);
+            }}
+            className="max-w-xs"
+          >
+            <option value="">Todo el personal a mi alcance</option>
+            {usuariosFiltrables.map((u) => (
+              <option key={u._id} value={u._id}>
+                {u.nombre} ({ROL_LABELS[u.rol]})
+              </option>
+            ))}
+          </Select>
+        )}
+        <Select
+          value={accion}
+          onChange={(e) => {
+            setPage(1);
+            setAccion(e.target.value);
+          }}
+          className="max-w-xs"
+        >
+          <option value="">Todas las acciones</option>
+          {ACCIONES_AUDITORIA.map((a) => (
+            <option key={a} value={a}>
+              {ACCION_LABELS[a]}
+            </option>
+          ))}
+        </Select>
+      </div>
+
+      <AlertBanner>{error}</AlertBanner>
+
+      <DataTable columns={columns} rows={registros} rowKey="_id" loading={loading} emptyMessage="No hay actividad registrada" />
+      <Pagination page={page} totalPages={totalPages} onChange={setPage} />
+    </div>
+  );
+}
