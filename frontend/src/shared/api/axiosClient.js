@@ -1,7 +1,17 @@
 import axios from 'axios';
 import { STORAGE_KEYS } from '../authStorage';
 
-const baseURL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+// Tolera valores mal pegados en el panel de Render: "VITE_API_URL=https://..." o sin el /api final.
+function normalizarBaseURL(valor) {
+  const url = (valor || 'http://localhost:5000/api')
+    .trim()
+    .replace(/^VITE_API_URL\s*=\s*/, '')
+    .replace(/^["']|["']$/g, '')
+    .replace(/\/+$/, '');
+  return url.endsWith('/api') ? url : `${url}/api`;
+}
+
+const baseURL = normalizarBaseURL(import.meta.env.VITE_API_URL);
 
 const axiosClient = axios.create({ baseURL });
 
